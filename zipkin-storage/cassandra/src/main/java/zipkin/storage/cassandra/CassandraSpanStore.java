@@ -57,6 +57,7 @@ import zipkin.internal.Nullable;
 import zipkin.storage.QueryRequest;
 import zipkin.storage.guava.GuavaSpanStore;
 
+import static com.datastax.driver.core.querybuilder.QueryBuilder.bindMarker;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.collect.DiscreteDomain.integers;
@@ -82,6 +83,7 @@ public final class CassandraSpanStore implements GuavaSpanStore {
   private final PreparedStatement selectDependencies;
   private final PreparedStatement selectServiceNames;
   private final PreparedStatement selectSpanNames;
+  private final PreparedStatement selectTraceIds;
   private final PreparedStatement selectTraceIdsByServiceName;
   private final PreparedStatement selectTraceIdsByServiceNames;
   private final PreparedStatement selectTraceIdsBySpanName;
@@ -122,6 +124,14 @@ public final class CassandraSpanStore implements GuavaSpanStore {
             .and(QueryBuilder.eq("bucket", QueryBuilder.bindMarker("bucket")))
             .limit(QueryBuilder.bindMarker("limit_")));
 
+    selectTraceIds = session.prepare(
+        QueryBuilder.select("ts", "trace_id")
+            .from("traces")
+            .where(QueryBuilder.gte("ts", bindMarker("start_ts")))
+            .and(QueryBuilder.lte("ts", bindMarker("end_ts")))
+            .limit(bindMarker("limit_"))
+            .allowFiltering()); // cannot order by, but that's ok as it is implied desc
+
     selectTraceIdsByServiceName = session.prepare(
         QueryBuilder.select("ts", "trace_id")
             .from(Tables.SERVICE_NAME_INDEX)
@@ -129,8 +139,7 @@ public final class CassandraSpanStore implements GuavaSpanStore {
             .and(QueryBuilder.in("bucket", QueryBuilder.bindMarker("bucket")))
             .and(QueryBuilder.gte("ts", QueryBuilder.bindMarker("start_ts")))
             .and(QueryBuilder.lte("ts", QueryBuilder.bindMarker("end_ts")))
-            .limit(QueryBuilder.bindMarker("limit_"))
-            .orderBy(QueryBuilder.desc("ts")));
+            .limit(QueryBuilder.bindMarker("limit_")));
 
     selectTraceIdsBySpanName = session.prepare(
         QueryBuilder.select("ts", "trace_id")
@@ -139,8 +148,7 @@ public final class CassandraSpanStore implements GuavaSpanStore {
                 QueryBuilder.eq("service_span_name", QueryBuilder.bindMarker("service_span_name")))
             .and(QueryBuilder.gte("ts", QueryBuilder.bindMarker("start_ts")))
             .and(QueryBuilder.lte("ts", QueryBuilder.bindMarker("end_ts")))
-            .limit(QueryBuilder.bindMarker("limit_"))
-            .orderBy(QueryBuilder.desc("ts")));
+            .limit(QueryBuilder.bindMarker("limit_")));
 
     selectTraceIdsByAnnotation = session.prepare(
         QueryBuilder.select("ts", "trace_id")
@@ -149,8 +157,7 @@ public final class CassandraSpanStore implements GuavaSpanStore {
             .and(QueryBuilder.in("bucket", QueryBuilder.bindMarker("bucket")))
             .and(QueryBuilder.gte("ts", QueryBuilder.bindMarker("start_ts")))
             .and(QueryBuilder.lte("ts", QueryBuilder.bindMarker("end_ts")))
-            .limit(QueryBuilder.bindMarker("limit_"))
-            .orderBy(QueryBuilder.desc("ts")));
+            .limit(QueryBuilder.bindMarker("limit_")));
 
     if (protocolVersion.compareTo(ProtocolVersion.V4) < 0) {
       LOG.warn("Please update Cassandra to 2.2 or later, as some features may fail");
@@ -164,8 +171,7 @@ public final class CassandraSpanStore implements GuavaSpanStore {
               .and(QueryBuilder.in("bucket", QueryBuilder.bindMarker("bucket")))
               .and(QueryBuilder.gte("ts", QueryBuilder.bindMarker("start_ts")))
               .and(QueryBuilder.lte("ts", QueryBuilder.bindMarker("end_ts")))
-              .limit(QueryBuilder.bindMarker("limit_"))
-              .orderBy(QueryBuilder.desc("ts")));
+              .limit(QueryBuilder.bindMarker("limit_")));
     }
 
     traceIdToTimestamp = input -> {
@@ -197,16 +203,8 @@ public final class CassandraSpanStore implements GuavaSpanStore {
       traceIdToTimestamp = getTraceIdsByServiceNames(Collections.singletonList(request.serviceName),
           request.endTs * 1000, request.lookback * 1000, traceIndexFetchSize);
     } else {
-      checkArgument(selectTraceIdsByServiceNames != null,
-          "getTraces without serviceName requires Cassandra 2.2 or later");
-      traceIdToTimestamp = transform(getServiceNames(),
-          new AsyncFunction<List<String>, Map<Long, Long>>() {
-            @Override
-            public ListenableFuture<Map<Long, Long>> apply(@Nullable List<String> serviceNames) {
-              return getTraceIdsByServiceNames(serviceNames,
-                  request.endTs * 1000, request.lookback * 1000, traceIndexFetchSize);
-            }
-          });
+      traceIdToTimestamp = getTraceIds(
+          request.endTs * 1000, request.lookback * 1000, traceIndexFetchSize);
     }
 
     List<String> annotationKeys = CassandraUtil.annotationKeys(request);
@@ -442,6 +440,22 @@ public final class CassandraSpanStore implements GuavaSpanStore {
           .setBytesUnsafe("start_ts", timestampCodec.serialize(startTs))
           .setBytesUnsafe("end_ts", timestampCodec.serialize(endTs))
           .setInt("limit_", limit);
+
+      return transform(session.executeAsync(bound), traceIdToTimestamp);
+    } catch (RuntimeException ex) {
+      return immediateFailedFuture(ex);
+    }
+  }
+
+  ListenableFuture<Map<Long, Long>> getTraceIds(long endTs, long lookback, int limit) {
+    long startTs = Math.max(endTs - lookback, 0); // >= 1970
+    try {
+      BoundStatement bound = CassandraUtil.bindWithName(selectTraceIds, "select-trace-ids")
+          .setBytesUnsafe("start_ts", timestampCodec.serialize(startTs))
+          .setBytesUnsafe("end_ts", timestampCodec.serialize(endTs))
+          .setInt("limit_", limit);
+
+      bound.setFetchSize(Integer.MAX_VALUE);
 
       return transform(session.executeAsync(bound), traceIdToTimestamp);
     } catch (RuntimeException ex) {

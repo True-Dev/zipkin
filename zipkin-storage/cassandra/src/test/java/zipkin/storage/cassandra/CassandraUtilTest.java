@@ -14,6 +14,8 @@
 package zipkin.storage.cassandra;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import java.util.Set;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
@@ -94,4 +96,19 @@ public class CassandraUtilTest {
     assertThat(CassandraUtil.annotationKeys(span))
         .containsOnly("web:aws.arn", "web:aws.arn:" + arn);
   }
+
+  @Test public void traceIdsSortedByDescTimestamp_doesntCollideOnSameTimestamp() {
+    Set<Long> sortedTraceIds = CassandraUtil.sortedKeysByValues(ImmutableMap.of(
+      11L, 1L,
+      12L, 1L,
+      13L, 2L
+    ));
+
+    try {
+      assertThat(sortedTraceIds).containsExactly(13L, 12L, 11L);
+    } catch (AssertionError e) {
+      assertThat(sortedTraceIds).containsExactly(13L, 11L, 12L);
+    }
+  }
+
 }

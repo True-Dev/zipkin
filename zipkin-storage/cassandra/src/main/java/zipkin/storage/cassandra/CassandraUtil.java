@@ -17,6 +17,7 @@ import com.datastax.driver.core.BoundStatement;
 import com.datastax.driver.core.PreparedStatement;
 import com.google.common.base.Function;
 import com.google.common.collect.Sets;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
@@ -25,12 +26,14 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import zipkin.Annotation;
 import zipkin.BinaryAnnotation;
 import zipkin.Constants;
 import zipkin.Span;
-import zipkin.internal.Nullable;
 import zipkin.storage.QueryRequest;
 
 import static zipkin.internal.Util.UTF_8;
@@ -109,34 +112,49 @@ final class CassandraUtil {
   }
 
   static Function<Map<Long, Long>, Set<Long>> keyset() {
-    return (Function) KeySet.INSTANCE;
+    return KeySet.INSTANCE;
   }
 
   static BoundStatement bindWithName(PreparedStatement prepared, String name) {
     return new NamedBoundStatement(prepared, name);
   }
 
-  enum KeySet implements Function<Map<Object, ?>, Set<Object>> {
+  enum KeySet implements Function<Map<Long, Long>, Set<Long>> {
     INSTANCE;
 
-    @Override public Set<Object> apply(@Nullable Map<Object, ?> input) {
-      return input.keySet();
+    @Override public Set<Long> apply(Map<Long, Long> input) {
+      return sortedKeysByValues(input);
     }
   }
 
   static Function<List<Map<Long, Long>>, Set<Long>> intersectKeySets() {
-    return (Function) IntersectKeySets.INSTANCE;
+    return IntersectKeySets.INSTANCE;
   }
 
-  enum IntersectKeySets implements Function<List<Map<Object, ?>>, Set<Object>> {
+  enum IntersectKeySets implements Function<List<Map<Long, Long>>, Set<Long>> {
     INSTANCE;
 
-    @Override public Set<Object> apply(@Nullable List<Map<Object, ?>> input) {
-      Set<Object> traceIds = Sets.newLinkedHashSet(input.get(0).keySet());
+    @Override public Set<Long> apply(List<Map<Long, Long>> input) {
+      Set<Long> traceIds = Sets.newLinkedHashSet(sortedKeysByValues(input.get(0)));
       for (int i = 1; i < input.size(); i++) {
-        traceIds.retainAll(input.get(i).keySet());
+        traceIds.retainAll(sortedKeysByValues(input.get(i)));
       }
       return traceIds;
     }
   }
+
+  static Set<Long> sortedKeysByValues(Map<Long, Long> map) {
+    // timestamps can collide, so we need to add some random digits on end before using them
+    SortedMap<BigInteger, Long> sorted = new TreeMap<>(Collections.reverseOrder());
+    for (Map.Entry<Long, Long> entry : map.entrySet()) {
+      BigInteger uncollided = BigInteger.valueOf(entry.getValue())
+        .multiply(OFFSET)
+        .add(BigInteger.valueOf(RAND.nextInt()));
+      sorted.put(uncollided, entry.getKey());
+    }
+    return new LinkedHashSet<>(sorted.values());
+  }
+
+  private static final Random RAND = new Random(System.nanoTime());
+  private static final BigInteger OFFSET = BigInteger.valueOf(Integer.MAX_VALUE);
 }
